@@ -11,13 +11,16 @@ import uuid
 import typer
 import yaml
 from podcastfy.content_parser.content_extractor import ContentExtractor
-from podcastfy.content_generator import ContentGenerator
+from podcastfy.content_generator import ContentGenerator, LLMBackend
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate
 from podcastfy.text_to_speech import TextToSpeech
 from podcastfy.utils.config import Config, load_config
 from podcastfy.utils.config_conversation import load_conversation_config
 from podcastfy.utils.logger import setup_logger
 from typing import List, Optional, Dict, Any
 import copy
+from dataclasses import dataclass
 
 import logging
 
@@ -39,6 +42,54 @@ app = typer.Typer()
 os.environ["LANGCHAIN_TRACING_V2"] = "False"
 
 
+@dataclass
+class ProcessedContent:
+    """
+    Represents the result of the content processing pipeline.
+
+    Attributes:
+        transcript_file_path (Optional[str]): Path to the generated transcript file, if any.
+        urls (Optional[List[str]]): List of URLs that were processed, if applicable.
+        audio_file_path (Optional[str]): Path to the generated audio file, if any.
+        description (Optional[str]): Generated description based on the transcript or processed content.
+    """
+    transcript_file_path: Optional[str]
+    urls: Optional[List[str]]
+    audio_file_path: Optional[str]
+    description: Optional[str]
+
+def generate_description(transcript: str,
+                         config: Dict[str, Any],
+                         is_local: bool=False, 
+                         model_name: str="gemini-1.5-pro-latest", 
+                         api_key_label: str="GEMINI_API_KEY",
+                         conversation_config: Optional[Dict[str, Any]] = None) -> str:
+    # Simulate using LangChain for description generation
+    logger.info("Generating podcast description.")
+
+    config_conversation = load_conversation_config(conversation_config)
+    backend = LLMBackend(
+            is_local=is_local,
+            temperature=config_conversation.get("creativity", 1),
+            max_output_tokens=8192,
+            model_name=model_name,
+            api_key_label=api_key_label,
+        )
+    
+    llm = backend.llm
+
+    prompt = PromptTemplate(
+    input_variables=["transcript"],
+    template=config.get("podcast_description_generation_prompt", "You are a podcast editor. Analyze this podcast transcript and create 3 paragraphs of description for it, making sure you note the data, author and topic: \n\n{transcript} \n\Podcast Description:")
+)
+    description_chain = prompt | llm | StrOutputParser()
+    description = description_chain.invoke({"transcript": transcript})
+
+    logger.info(f"Generated podcast description: {description}")
+
+    return description
+
+
 def process_content(
     urls: Optional[List[str]] = None,
     transcript_file: Optional[str] = None,
@@ -53,34 +104,29 @@ def process_content(
     api_key_label: Optional[str] = None,
     topic: Optional[str] = None,
     longform: bool = False
-):
+) -> ProcessedContent:
     """
-    Process URLs, a transcript file, image paths, or raw text to generate a podcast or transcript.
+    Process URLs, a transcript file, image paths, or raw text to generate a podcast or transcript,
+    returning a dataclass with transcript, URLs, audio file path, and a generated description.
     """
     try:
         if config is None:
             config = load_config()
 
-        # Load default conversation config
         conv_config = load_conversation_config()
-
-        # Update with provided config if any
         if conversation_config:
             conv_config.configure(conversation_config)
-        # Get output directories from conversation config
+
         tts_config = conv_config.get("text_to_speech", {})
         output_directories = tts_config.get("output_directories", {})
 
+        qa_content = ""
         if transcript_file:
             logger.info(f"Using transcript file: {transcript_file}")
             with open(transcript_file, "r") as file:
                 qa_content = file.read()
         else:
-            # Initialize content_extractor if needed
-            content_extractor = None
-            if urls or topic or (text and longform and len(text.strip()) < 100):
-                content_extractor = ContentExtractor()
-
+            content_extractor = ContentExtractor() if urls or topic or (text and longform and len(text.strip()) < 100) else None
             content_generator = ContentGenerator(
                 is_local=is_local,
                 model_name=model_name,
@@ -89,7 +135,6 @@ def process_content(
             )
 
             combined_content = ""
-            
             if urls:
                 logger.info(f"Processing {len(urls)} links")
                 contents = [content_extractor.extract_content(link) for link in urls]
@@ -97,7 +142,6 @@ def process_content(
 
             if text:
                 if longform and len(text.strip()) < 100:
-                    logger.info("Text too short for direct long-form generation. Extracting context...")
                     expanded_content = content_extractor.generate_topic_content(text)
                     combined_content += f"\n\n{expanded_content}"
                 else:
@@ -107,7 +151,6 @@ def process_content(
                 topic_content = content_extractor.generate_topic_content(topic)
                 combined_content += f"\n\n{topic_content}"
 
-            # Generate Q&A content using output directory from conversation config
             random_filename = f"transcript_{uuid.uuid4().hex}.txt"
             transcript_filepath = os.path.join(
                 output_directories.get("transcripts", "data/transcripts"),
@@ -120,32 +163,41 @@ def process_content(
                 longform=longform
             )
 
+        audio_file_path = None
         if generate_audio:
-            api_key = None
-            if tts_model != "edge":
-                api_key = getattr(config, f"{tts_model.upper().replace('MULTI', '')}_API_KEY")
+            api_key = None if tts_model == "edge" else getattr(config, f"{tts_model.upper().replace('MULTI', '')}_API_KEY")
 
             text_to_speech = TextToSpeech(
                 model=tts_model,
                 api_key=api_key,
                 conversation_config=conv_config.to_dict(),
             )
-
             random_filename = f"podcast_{uuid.uuid4().hex}.mp3"
-            audio_file = os.path.join(
+            audio_file_path = os.path.join(
                 output_directories.get("audio", "data/audio"), random_filename
             )
-            text_to_speech.convert_to_speech(qa_content, audio_file)
+            text_to_speech.convert_to_speech(qa_content, audio_file_path)
             logger.info(f"Podcast generated successfully using {tts_model} TTS model")
-            return audio_file
-        else:
-            logger.info(f"Transcript generated successfully: {transcript_filepath}")
-            return transcript_filepath
+
+        description = generate_description(transcript=qa_content, 
+                                           config=config, 
+                                           is_local=is_local, 
+                                           model_name=model_name, 
+                                           api_key_label=api_key_label, 
+                                           conversation_config=conversation_config
+        )
+        
+
+        return ProcessedContent(
+            transcript_file_path=transcript_filepath,
+            urls=urls,
+            audio_file_path=audio_file_path,
+            description=description
+        )
 
     except Exception as e:
         logger.error(f"An error occurred in the process_content function: {str(e)}")
         raise
-
 
 @app.command()
 def main(
