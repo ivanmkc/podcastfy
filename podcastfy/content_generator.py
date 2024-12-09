@@ -10,18 +10,26 @@ import os
 from typing import Optional, Dict, Any, List
 import re
 
+import logging
 
 from langchain_community.chat_models import ChatLiteLLM
 from langchain_google_genai import ChatGoogleGenerativeAI
+# from langchain_google_vertexai import ChatVertexAI
 from langchain_community.llms.llamafile import Llamafile
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain import hub
+
+from podcastfy.edits.edits import convert_edits_response_to_models_raw, apply_edits, add_line_numbers
+from podcastfy.edits.redundancy_removal import remove_redundant_sentences, GeminiEmbeddingFunction, ThresholdStopCondition
 from podcastfy.utils.config_conversation import load_conversation_config
 from podcastfy.utils.config import load_config
-import logging
+
 from langchain.prompts import HumanMessagePromptTemplate
 from abc import ABC, abstractmethod
+from langchain_core.utils.function_calling import convert_to_openai_function
+import vertexai
+from vertexai.generative_models import GenerativeModel
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +76,11 @@ class LLMBackend:
                 max_output_tokens=max_output_tokens,
                 **common_params,
             )
+            # self.llm = ChatVertexAI(
+            #     model=model_name,
+            #     max_output_tokens=max_output_tokens,
+            #     **common_params,
+            # )
         else:  # user should set api_key_label from input
             self.llm = ChatLiteLLM(
                 model=self.model_name,
@@ -526,41 +539,112 @@ class LongFormContentStrategy(ContentGenerationStrategy, ContentCleanerMixin):
         # Run rewriting chain
         llm = self.llm
 
-        analysis_prompt = PromptTemplate(
-            input_variables=["transcript"],
-            template=config.get("analysis_prompt_template", "You are a podcast editor. Analyze this podcast transcript and identify duplicated/repeated lines and recommendations to improve flow. Do not remove too many facts or add any new facts: \n\n{transcript} \n\nAnalysis (bullet-points, with line numbers referring to problematic lines.):")
-        )
-        analysis_chain = analysis_prompt | llm | StrOutputParser()
+        # analysis_prompt_template = config.get("longform_analysis_prompt_template")
+        # rewrite_prompt_template = config.get("longform_rewrite_prompt_template")
 
-        rewrite_prompt = PromptTemplate(
-            input_variables=["transcript", "analysis"],
-            template=config.get("rewrite_prompt_template", "Rewrite the podcast transcript by applying only the following recommendations. Refrain from shortening the transcript too much.\n\nRecommendations: \n\n{analysis}\n\nOriginal Transcript: \n\n{transcript}\n\nRewritten Transcript:")
-        )
-        rewrite_chain = rewrite_prompt | llm | StrOutputParser()
-
-        try:
-            logger.debug("Executing analysis chain")
-            analysis = analysis_chain.invoke({"transcript": transcript})
-            logger.debug(f"Successfully analyzed transcript: \n\n{analysis}")
-
-            logger.debug("Executing rewriting chain")
-            rewritten_response = rewrite_chain.invoke({"analysis": analysis, "transcript": transcript})
-            if not rewritten_response:
-                logger.warning("Rewriting chain returned empty response")
-                # Fall back to original
-                rewritten_response = transcript
-            logger.debug("Successfully rewrote transcript")
-            logger.debug(f"Successfully rewrote transcript, BEFORE = \n\n{transcript}")
-            logger.debug(f"Successfully rewrote transcript, AFTER = \n\n{rewritten_response}")
-        except Exception as e:
-            logger.error(f"Error in rewriting chain: {str(e)}")
-            rewritten_response = transcript  # Fall back to original
+        # if analysis_prompt_template is not None and rewrite_prompt_template is not None:
+        #     analysis_prompt = PromptTemplate(
+        #         input_variables=["transcript"],
+        #         template=analysis_prompt_template
+        #     )
+        #     # edits_response_dict_schema = convert_to_openai_function(EditsResponse)
+        #     analysis_chain = analysis_prompt | llm.with_structured_output(EditsResponse)
             
-        final_transcript = self._fix_alternating_tags(rewritten_response)
+        #     rewrite_prompt = PromptTemplate(
+        #         input_variables=["transcript", "analysis"],
+        #         template=rewrite_prompt_template
+        #     )
+        #     rewrite_chain = rewrite_prompt | llm | StrOutputParser()
+
+        #     try:
+        #         logger.debug("Executing analysis chain")
+        #         analysis = analysis_chain.invoke({"transcript": transcript})
+        #         logger.debug(f"Successfully analyzed transcript: \n\n{analysis}")
+
+        #         logger.debug("Executing rewriting chain")
+        #         rewritten_response = rewrite_chain.invoke({"analysis": analysis, "transcript": transcript})
+        #         if not rewritten_response:
+        #             logger.warning("Rewriting chain returned empty response")
+        #             # Fall back to original
+        #             rewritten_response = transcript
+        #         logger.debug("Successfully rewrote transcript")
+        #         logger.debug(f"Successfully rewrote transcript, BEFORE = \n\n{transcript}")
+        #         logger.debug(f"Successfully rewrote transcript, AFTER = \n\n{rewritten_response}")
+        #     except Exception as e:
+        #         logger.error(f"Error in rewriting chain: {str(e)}")
+        #         rewritten_response = transcript  # Fall back to original
+        # else:
+        #     logger.warning("Prompt templates not found for analysis and rewriting")
+        #     rewritten_response = transcript
+            
+        # final_transcript = self._fix_alternating_tags(transcript=transcript)
         
-        logger.debug("Completed transcript cleaning process")
+        # logger.debug("Completed transcript cleaning process")
         
-        return final_transcript
+        # return final_transcript
+
+        # # Part one: Remove redundant sentences
+        # # Create the necessary objects
+        # embedding_function = GeminiEmbeddingFunction()
+        # stop_condition = ThresholdStopCondition(threshold=0.95)
+
+        # # Run the algorithm
+        # reduced_transcript = remove_redundant_sentences(transcript, stop_condition, embedding_function)
+
+        # Part two: Apply edits to the transcript
+        transcript_with_lines = add_line_numbers(transcript=transcript).strip()
+        edit_prompt_template = """
+        You are a podcast editor. 
+        Suggest other edits to the transcript to fix any grammar errors. Strive to make a clean flow make sense from speaker to speaker.
+
+        Example:
+            [
+                {{
+                    "action": "addition",
+                    "line_number": 5,
+                    "text": "This is the newly added line."
+                }},
+                {{
+                    "action": "replace",
+                    "line_number": 10,
+                    "text": "Replace the content of line 10 with this text."
+                }}
+            ]
+            
+        Each dictionary in the `edits` list should contain:
+            - action: A string, either "addition" or "replace".
+            - line_number: An integer specifying the target line (1-based).
+            - text: A string representing the text to add or replace at the specified line.
+                    For "addition", this text is inserted at the given line.
+                    For "replace", this text replaces the line. If text is empty for "replace",
+                    it effectively deletes that line.
+        
+        Transcript:
+        {transcript}
+
+        List of edits of deletions and additions (no comments or preamble):
+        """
+        
+        edit_prompt = PromptTemplate(
+            input_variables=["transcript"],
+            template=edit_prompt_template
+        )
+
+        edit_chain = edit_prompt | llm
+
+        logger.debug("Executing edit chain")
+        edit = edit_chain.invoke({"transcript": transcript_with_lines})
+        logger.debug(f"Successfully analyzed transcript: \n\n{edit}")
+
+
+        edits = convert_edits_response_to_models_raw(edit.content)
+
+        transcript_edited = apply_edits([line.split(":")[1].strip() for line in transcript_with_lines.split("\n")], edits)
+
+        final_transcript =  "\n".join(transcript_edited).strip()
+
+        return self._fix_alternating_tags(transcript=final_transcript)
+
 
          
     def _clean_transcript_response_DEPRECATED(self, transcript: str, config: Dict[str, Any]) -> str:

@@ -18,9 +18,13 @@ from podcastfy.text_to_speech import TextToSpeech
 from podcastfy.utils.config import Config, load_config
 from podcastfy.utils.config_conversation import load_conversation_config
 from podcastfy.utils.logger import setup_logger
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 import copy
 from dataclasses import dataclass
+
+# Import necessary classes for structured output parsing
+from pydantic import BaseModel, Field
+
 
 import logging
 
@@ -51,43 +55,125 @@ class ProcessedContent:
         transcript_file_path (Optional[str]): Path to the generated transcript file, if any.
         urls (Optional[List[str]]): List of URLs that were processed, if applicable.
         audio_file_path (Optional[str]): Path to the generated audio file, if any.
+        title (Optional[str]): Generated title based on the transcript or processed content.
         description (Optional[str]): Generated description based on the transcript or processed content.
     """
+
     transcript_file_path: Optional[str]
     urls: Optional[List[str]]
     audio_file_path: Optional[str]
+    title: Optional[str]
     description: Optional[str]
 
-def generate_description(transcript: str,
-                         config: Dict[str, Any],
-                         is_local: bool=False, 
-                         model_name: str="gemini-1.5-pro-latest", 
-                         api_key_label: str="GEMINI_API_KEY",
-                         conversation_config: Optional[Dict[str, Any]] = None) -> str:
-    # Simulate using LangChain for description generation
-    logger.info("Generating podcast description.")
+def detect_and_unescape(string):
+    """
+    Detects and unescapes escape sequences in a given string.
+
+    Args:
+        string (str): The input string potentially containing escape sequences.
+
+    Returns:
+        str: The unescaped version of the string if it contains escape sequences, 
+             otherwise the original string.
+    """
+    try:
+        # Check if there are any escape sequences by comparing with unescaped version
+        unescaped_string = string.encode('utf-8').decode('unicode_escape')
+        return unescaped_string
+    except (UnicodeDecodeError, AttributeError):
+        # If decoding fails or the string is already plain, return it as is
+        return string
+    
+def generate_description_and_title(
+    transcript: str,
+    config: Dict[str, Any],
+    is_local: bool = False,
+    model_name: str = "gemini-1.5-pro-latest",
+    api_key_label: str = "GEMINI_API_KEY",
+    conversation_config: Optional[Dict[str, Any]] = None,
+    generate_title: bool = True,
+) -> Tuple[Optional[str], str]:
+    # Simulate using LangChain for title and description generation with structured output
+    if generate_title:
+        logger.info("Generating podcast title and description.")
+    else:
+        logger.info("Generating podcast description.")
 
     config_conversation = load_conversation_config(conversation_config)
     backend = LLMBackend(
-            is_local=is_local,
-            temperature=config_conversation.get("creativity", 1),
-            max_output_tokens=8192,
-            model_name=model_name,
-            api_key_label=api_key_label,
-        )
-    
+        is_local=is_local,
+        temperature=config_conversation.get("creativity", 1),
+        max_output_tokens=8192,
+        model_name=model_name,
+        api_key_label=api_key_label,
+    )
+
     llm = backend.llm
 
+    # Define the schema using Pydantic
+    if generate_title:
+
+        class PodcastOutput(BaseModel):
+            """Podcast title and description."""
+
+            title: str = Field(description="The podcast title")
+            description: str = Field(description="The podcast description")
+
+    else:
+
+        class PodcastOutput(BaseModel):
+            """Podcast description."""
+
+            description: str = Field(description="The podcast description")
+
+    # Create an LLM with structured output
+    structured_llm = llm.with_structured_output(PodcastOutput)
+
+    # Prepare the prompt
+    if generate_title:
+        what_to_generate = (
+            "Extract the original article title of the source material (do not include the podcast name) and generate a 3-paragraph description"
+        )
+    else:
+        what_to_generate = "a 3-paragraph description"
+
+    prompt_template_str = config.get(
+        "podcast_generation_prompt",
+        (
+            "You are a podcast editor. Analyze the following podcast transcript and create {what_to_generate} for it, "
+            "noting the date, author, and topic.\n\nDo not escape quotation marks or special characters.\n\n"
+            "Transcript:\n{transcript}"
+        ),
+    )
+
     prompt = PromptTemplate(
-    input_variables=["transcript"],
-    template=config.get("podcast_description_generation_prompt", "You are a podcast editor. Analyze this podcast transcript and create 3 paragraphs of description for it, making sure you note the data, author and topic: \n\n{transcript} \n\Podcast Description:")
-)
-    description_chain = prompt | llm | StrOutputParser()
-    description = description_chain.invoke({"transcript": transcript})
+        input_variables=["transcript", "what_to_generate"],
+        template=prompt_template_str,
+    )
+
+    # Create an LLM chain
+    chain = prompt | structured_llm
+
+    # Run the chain to get structured output
+    output = chain.invoke(
+        {
+            "transcript": transcript,
+            "what_to_generate": what_to_generate,
+        }
+    )
+
+    # Extract title and description from the output
+    if generate_title:
+        title = detect_and_unescape(output.title)
+        description = detect_and_unescape(output.description)
+        logger.info(f"Generated podcast title: {title}")
+    else:
+        title = None
+        description = detect_and_unescape(output.description)
 
     logger.info(f"Generated podcast description: {description}")
 
-    return description
+    return title, description
 
 
 def process_content(
@@ -103,7 +189,7 @@ def process_content(
     model_name: Optional[str] = None,
     api_key_label: Optional[str] = None,
     topic: Optional[str] = None,
-    longform: bool = False
+    longform: bool = False,
 ) -> ProcessedContent:
     """
     Process URLs, a transcript file, image paths, or raw text to generate a podcast or transcript,
@@ -126,12 +212,16 @@ def process_content(
             with open(transcript_file, "r") as file:
                 qa_content = file.read()
         else:
-            content_extractor = ContentExtractor() if urls or topic or (text and longform and len(text.strip()) < 100) else None
+            content_extractor = (
+                ContentExtractor()
+                if urls or topic or (text and longform and len(text.strip()) < 100)
+                else None
+            )
             content_generator = ContentGenerator(
                 is_local=is_local,
                 model_name=model_name,
                 api_key_label=api_key_label,
-                conversation_config=conv_config.to_dict()
+                conversation_config=conv_config.to_dict(),
             )
 
             combined_content = ""
@@ -160,12 +250,18 @@ def process_content(
                 combined_content,
                 image_file_paths=image_paths or [],
                 output_filepath=transcript_filepath,
-                longform=longform
+                longform=longform,
             )
 
         audio_file_path = None
         if generate_audio:
-            api_key = None if tts_model == "edge" else getattr(config, f"{tts_model.upper().replace('MULTI', '')}_API_KEY")
+            api_key = (
+                None
+                if tts_model == "edge"
+                else getattr(
+                    config, f"{tts_model.upper().replace('MULTI', '')}_API_KEY"
+                )
+            )
 
             text_to_speech = TextToSpeech(
                 model=tts_model,
@@ -179,25 +275,27 @@ def process_content(
             text_to_speech.convert_to_speech(qa_content, audio_file_path)
             logger.info(f"Podcast generated successfully using {tts_model} TTS model")
 
-        description = generate_description(transcript=qa_content, 
-                                           config=config, 
-                                           is_local=is_local, 
-                                           model_name=model_name, 
-                                           api_key_label=api_key_label, 
-                                           conversation_config=conversation_config
+        title, description = generate_description_and_title(
+            transcript=qa_content,
+            config=config,
+            is_local=is_local,
+            model_name=model_name,
+            api_key_label=api_key_label,
+            conversation_config=conversation_config,
         )
-        
 
         return ProcessedContent(
             transcript_file_path=transcript_filepath,
             urls=urls,
             audio_file_path=audio_file_path,
-            description=description
+            title=title,
+            description=description,
         )
 
     except Exception as e:
         logger.error(f"An error occurred in the process_content function: {str(e)}")
         raise
+
 
 @app.command()
 def main(
@@ -245,10 +343,10 @@ def main(
         None, "--topic", "-tp", help="Topic to generate podcast about"
     ),
     longform: bool = typer.Option(
-        False, 
-        "--longform", 
-        "-lf", 
-        help="Generate long-form content (only available for text input without images)"
+        False,
+        "--longform",
+        "-lf",
+        help="Generate long-form content (only available for text input without images)",
     ),
 ):
     """
@@ -283,7 +381,7 @@ def main(
                 model_name=llm_model_name,
                 api_key_label=api_key_label,
                 topic=topic,
-                longform=longform
+                longform=longform,
             )
         else:
             urls_list = urls or []
@@ -307,7 +405,7 @@ def main(
                 model_name=llm_model_name,
                 api_key_label=api_key_label,
                 topic=topic,
-                longform=longform
+                longform=longform,
             )
 
         if transcript_only:
@@ -341,7 +439,7 @@ def generate_podcast(
     api_key_label: Optional[str] = None,
     topic: Optional[str] = None,
     longform: bool = False,
-) -> Optional[str]:
+) -> Optional[ProcessedContent]:
     """
     Generate a podcast or transcript from a list of URLs, a file containing URLs, a transcript file, or image files.
 
@@ -407,7 +505,7 @@ def generate_podcast(
                 model_name=llm_model_name,
                 api_key_label=api_key_label,
                 topic=topic,
-                longform=longform
+                longform=longform,
             )
         else:
             urls_list = urls or []
@@ -433,7 +531,7 @@ def generate_podcast(
                 model_name=llm_model_name,
                 api_key_label=api_key_label,
                 topic=topic,
-                longform=longform
+                longform=longform,
             )
 
     except Exception as e:

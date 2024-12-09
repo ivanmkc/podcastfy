@@ -10,6 +10,9 @@ content_generator:
   cleaner_prompt_commit: "8c110a0b"
   rewriter_prompt_template: "souzatharsis/podcast_rewriter"
   rewriter_prompt_commit: "8ee296fb"
+  longform_analysis_prompt_template: "You are a podcast editor. Analyze this podcast transcript and identify duplicated/repeated lines and recommendations to improve flow. Do not remove too many facts or add any new facts: \n\n{transcript} \n\nList of Git-diff style edits of deletions and additions:"
+  longform_rewrite_prompt_template: "Rewrite the podcast transcript by applying only the following edits. \n\nEdits: \n\n{analysis}\n\nOriginal Transcript: \n\n{transcript}\n\nEdited Transcript:"
+
 content_extractor:
   youtube_url_patterns:
     - "youtube.com"
