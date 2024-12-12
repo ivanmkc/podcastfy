@@ -2,6 +2,9 @@ import logging
 from enum import Enum
 from typing import List, Dict, Any
 from pydantic import BaseModel, Field
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.prompts import PromptTemplate
+
 import json
 
 # Configure logging
@@ -69,28 +72,32 @@ def convert_edits_response_to_models_raw(raw_json: str) -> List[EditModel]:
 def convert_edits_response_to_models(response: EditsResponse) -> List[EditModel]:
     edit_models = []
     for edit_dict in response.edits:
-        action_str = edit_dict.get("action")
-        line_num_raw = edit_dict.get("line_number")
-        
-        if line_num_raw is None:
-            raise KeyError("Missing required field 'line_number'")
         try:
-            line_num = int(line_num_raw)
-        except (TypeError, ValueError):
-            raise ValueError(f"line_number must be an integer, got {line_num_raw}")
-        
-        text_str = edit_dict.get("text", "")
-        text_str = clean_text(text_str)
+            action_str = edit_dict.get("action")
+            line_num_raw = edit_dict.get("line_number")
+            
+            if line_num_raw is None:
+                raise KeyError("Missing required field 'line_number'")
+            try:
+                line_num = int(line_num_raw)
+            except (TypeError, ValueError):
+                raise ValueError(f"line_number must be an integer, got {line_num_raw}")
+            
+            text_str = edit_dict.get("text", "")
+            text_str = clean_text(text_str)
 
-        if action_str not in ("addition", "replace"):
-            raise ValueError(f"Invalid action '{action_str}' provided.")
+            if action_str not in ("addition", "replace"):
+                raise ValueError(f"Invalid action '{action_str}' provided.")
 
-        edit_model = EditModel(
-            action=action_str,
-            line_number=line_num,
-            text=text_str
-        )
-        edit_models.append(edit_model)
+            edit_model = EditModel(
+                action=action_str,
+                line_number=line_num,
+                text=text_str
+            )
+            edit_models.append(edit_model)
+        except Exception as e:
+            logger.error(f"Error converting edit: {edit_dict}")
+            logger.error(e)
 
     return edit_models
 
@@ -155,3 +162,99 @@ def apply_edits(lines: List[str], edits: List[EditModel]) -> List[str]:
     # final_lines is always kept sorted, no additional sort needed
     updated_texts = [t for (_, t) in final_lines]
     return updated_texts
+
+from typing import List
+import logging
+
+# Assume the following functions and objects are already defined in your codebase:
+# add_line_numbers, PromptTemplate, llm, convert_edits_response_to_models_raw, apply_edits, logger
+
+def edit_transcript(
+    transcript: str,
+    instruction: str,
+    llm: BaseChatModel
+) -> str:
+    """
+    Edits a podcast transcript by fixing grammar errors and ensuring a clean flow between speakers.
+
+    Parameters:
+        transcript (str): The original transcript to be edited.
+        instruction (str, optional): The prompt sentence guiding the edits.
+                                    Example:
+                                    "Suggest other edits to the transcript to fix any grammar errors. 
+                                     Strive to make a clean flow make sense from speaker to speaker."
+
+    Returns:
+        str: The final edited transcript.
+    """
+    # Add line numbers to the transcript
+    transcript_with_lines: str = add_line_numbers(transcript=transcript).strip()
+
+    # Define the prompt template with the configurable suggestion
+    edit_prompt_template: str = """
+You are a podcast editor. 
+{instruction}
+
+Example:
+    [
+        {{
+            "action": "addition",
+            "line_number": 5,
+            "text": "This is the newly added line."
+        }},
+        {{
+            "action": "replace",
+            "line_number": 10,
+            "text": "Replace the content of line 10 with this text."
+        }}
+    ]
+    
+Each dictionary in the `edits` list should contain:
+    - action: A string, either "addition" or "replace".
+    - line_number: An integer specifying the target line (1-based).
+    - text: A string representing the text to add or replace at the specified line.
+            For "addition", this text is inserted at the given line.
+            For "replace", this text replaces the line. If text is empty for "replace",
+            it effectively deletes that line.
+
+Transcript:
+{transcript}
+
+List of edits of deletions and additions (no comments or preamble):
+"""
+
+    # Create a PromptTemplate instance with the provided template
+    edit_prompt: PromptTemplate = PromptTemplate(
+        input_variables=["transcript"],
+        template=edit_prompt_template
+    )
+
+    # Combine the prompt template with the language model (llm)
+    edit_chain = edit_prompt | llm
+
+    # Log the execution of the edit chain
+    logger.debug("Executing edit chain")
+
+    # Invoke the language model with the transcript to get edits
+    edit_str: str = edit_chain.invoke({"transcript": transcript_with_lines, "instruction": instruction}).content
+
+    # Convert the raw edit response into structured edit models
+    edits: List[EditModel] = convert_edits_response_to_models_raw(edit_str)
+    
+    # Log edits
+    logger.debug(f"{len(edits)} edits proposed.") 
+    for edit in edits:
+        logger.debug(f"Edit: {edit}")
+
+    # Prepare the transcript lines for editing
+    original_lines: List[str] = [
+        line.split(":", 1)[1].strip() for line in transcript_with_lines.split("\n") if ":" in line
+    ]
+
+    # Apply the edits to the original transcript lines
+    transcript_edited: List[str] = apply_edits(original_lines, edits)
+
+    # Join the edited lines into the final transcript
+    final_transcript: str = "\n".join(transcript_edited).strip()
+
+    return final_transcript
