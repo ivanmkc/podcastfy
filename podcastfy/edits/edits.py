@@ -4,7 +4,12 @@ from typing import List, Dict, Any
 from pydantic import BaseModel, Field
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
+from typing import List
+import logging
+
+import re
 import json
 
 # Configure logging
@@ -22,6 +27,10 @@ class EditModel(BaseModel):
     line_number: int = Field(
         description="The line number where the edit is to be applied (1-based)."
     )
+    rationale: str = Field(
+        default="",
+        description="The rationale or reason for the edit."
+    )
     text: str = Field(
         default="",
         description="The text to use for addition or replacement. If empty on replace, it's effectively a deletion."
@@ -37,11 +46,13 @@ class EditsResponse(BaseModel):
                 {
                     "action": "addition",
                     "line_number": 5,
+                    "rationale: "This line provides additional context.",
                     "text": "This is the newly added line."
                 },
                 {
                     "action": "replace",
                     "line_number": 10,
+                    "rationale: "This line provides additional context.",
                     "text": "Replace the content of line 10 with this text."
                 }
             ]
@@ -64,7 +75,7 @@ def clean_text(value: str) -> str:
 
 def convert_edits_response_to_models_raw(raw_json: str) -> List[EditModel]:
     cleaned_json = clean_text(raw_json)
-    edits_data = json.loads(cleaned_json)
+    edits_data = load_json_agnostic_to_quotes(cleaned_json)
 
     response = EditsResponse(edits=edits_data)
     return convert_edits_response_to_models(response)
@@ -163,11 +174,24 @@ def apply_edits(lines: List[str], edits: List[EditModel]) -> List[str]:
     updated_texts = [t for (_, t) in final_lines]
     return updated_texts
 
-from typing import List
-import logging
-
-# Assume the following functions and objects are already defined in your codebase:
-# add_line_numbers, PromptTemplate, llm, convert_edits_response_to_models_raw, apply_edits, logger
+def load_json_agnostic_to_quotes(json_like_string):
+    # Check if the input is already valid JSON
+    try:
+        return json.loads(json_like_string)
+    except json.JSONDecodeError:
+        pass  # If this fails, we attempt preprocessing
+    
+    # Replace single quotes with double quotes, but cautiously
+    processed_string = re.sub(
+        r"(?<![\\\"'])'(?![\\\"'])", '"',  # Replace single quotes not surrounded by valid JSON syntax
+        json_like_string
+    )
+    
+    try:
+        # Attempt to load the processed string
+        return json.loads(processed_string)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Unable to parse JSON-like string: {e}")
 
 def edit_transcript(
     transcript: str,
@@ -200,18 +224,27 @@ Example:
         {{
             "action": "addition",
             "line_number": 5,
+            "rationale: "This line provides additional context.",
             "text": "This is the newly added line."
         }},
         {{
             "action": "replace",
             "line_number": 10,
+            "rationale: "This line provides additional context.",
             "text": "Replace the content of line 10 with this text."
+        }},
+        {{
+            "action": "replace",
+            "line_number": 13,
+            "rationale: "This line provides additional context.",
+            "text": ""
         }}
     ]
     
 Each dictionary in the `edits` list should contain:
     - action: A string, either "addition" or "replace".
     - line_number: An integer specifying the target line (1-based).
+    - rationale: A string explaining the reason for the edit.
     - text: A string representing the text to add or replace at the specified line.
             For "addition", this text is inserted at the given line.
             For "replace", this text replaces the line. If text is empty for "replace",
@@ -230,13 +263,13 @@ List of edits of deletions and additions (no comments or preamble):
     )
 
     # Combine the prompt template with the language model (llm)
-    edit_chain = edit_prompt | llm
+    edit_chain = edit_prompt | llm | StrOutputParser()
 
     # Log the execution of the edit chain
     logger.debug("Executing edit chain")
 
     # Invoke the language model with the transcript to get edits
-    edit_str: str = edit_chain.invoke({"transcript": transcript_with_lines, "instruction": instruction}).content
+    edit_str: str = edit_chain.invoke({"transcript": transcript_with_lines, "instruction": instruction})
 
     # Convert the raw edit response into structured edit models
     edits: List[EditModel] = convert_edits_response_to_models_raw(edit_str)

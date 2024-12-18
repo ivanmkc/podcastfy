@@ -27,9 +27,8 @@ from podcastfy.utils.config import load_config
 
 from langchain.prompts import HumanMessagePromptTemplate
 from abc import ABC, abstractmethod
-from langchain_core.utils.function_calling import convert_to_openai_function
-import vertexai
-from vertexai.generative_models import GenerativeModel
+from podcastfy.edits.edits import edit_transcript
+
 
 logger = logging.getLogger(__name__)
 
@@ -536,7 +535,16 @@ class LongFormContentStrategy(ContentGenerationStrategy, ContentCleanerMixin):
         """
         logger.debug("Starting transcript cleaning process")
 
-        return self._fix_alternating_tags(transcript=transcript)
+        transcript_processed = edit_transcript(
+            transcript=transcript,
+            instruction="Deduplicate lines to make sure they are not repeated. Remove/replace any redundant lines or sections using 'replace'. Use 'add' to make sure gaps are filled in.",
+            llm=self.llm,
+        )
+
+        # Remove all backticks from transcript
+        transcript_processed = transcript_processed.replace("`", "")
+
+        return self._fix_alternating_tags(transcript=transcript_processed)
 
 
          
