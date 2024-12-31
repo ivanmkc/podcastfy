@@ -190,6 +190,7 @@ def process_content(
     api_key_label: Optional[str] = None,
     topic: Optional[str] = None,
     longform: bool = False,
+    generate_title_and_description: bool = False,
 ) -> ProcessedContent:
     """
     Process URLs, a transcript file, image paths, or raw text to generate a podcast or transcript,
@@ -275,14 +276,18 @@ def process_content(
             text_to_speech.convert_to_speech(qa_content, audio_file_path)
             logger.info(f"Podcast generated successfully using {tts_model} TTS model")
 
-        title, description = generate_description_and_title(
-            transcript=qa_content,
-            config=config,
-            is_local=is_local,
-            model_name=model_name,
-            api_key_label=api_key_label,
-            conversation_config=conversation_config,
-        )
+        if generate_title_and_description:
+            title, description = generate_description_and_title(
+                transcript=qa_content,
+                config=config,
+                is_local=is_local,
+                model_name=model_name,
+                api_key_label=api_key_label,
+                conversation_config=conversation_config,
+            )
+        else:
+            title = None
+            description = None
 
         return ProcessedContent(
             transcript_file_path=transcript_filepath,
@@ -439,6 +444,7 @@ def generate_podcast(
     api_key_label: Optional[str] = None,
     topic: Optional[str] = None,
     longform: bool = False,
+    generate_title_and_description: bool = False,
 ) -> Optional[ProcessedContent]:
     """
     Generate a podcast or transcript from a list of URLs, a file containing URLs, a transcript file, or image files.
@@ -506,6 +512,7 @@ def generate_podcast(
                 api_key_label=api_key_label,
                 topic=topic,
                 longform=longform,
+                generate_title_and_description=generate_title_and_description,
             )
         else:
             urls_list = urls or []

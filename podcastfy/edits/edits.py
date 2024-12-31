@@ -3,8 +3,7 @@ from enum import Enum
 from typing import List, Dict, Any
 from pydantic import BaseModel, Field
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+from json_repair import repair_json
 
 from typing import List
 import logging
@@ -68,7 +67,9 @@ def add_line_numbers(transcript: str) -> str:
 def clean_text(value: str) -> str:
     cleaned = value.strip()
     if cleaned.startswith("```json"):
-        cleaned = cleaned[len("```json"):].strip()
+        cleaned = cleaned[7:].strip()    
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[3:].strip()
     if cleaned.endswith("```"):
         cleaned = cleaned[:-3].strip()
     return cleaned.strip()
@@ -103,7 +104,8 @@ def convert_edits_response_to_models(response: EditsResponse) -> List[EditModel]
             edit_model = EditModel(
                 action=action_str,
                 line_number=line_num,
-                text=text_str
+                text=text_str,
+                rationale=edit_dict.get("rationale")
             )
             edit_models.append(edit_model)
         except Exception as e:
@@ -174,21 +176,12 @@ def apply_edits(lines: List[str], edits: List[EditModel]) -> List[str]:
     updated_texts = [t for (_, t) in final_lines]
     return updated_texts
 
+
 def load_json_agnostic_to_quotes(json_like_string):
-    # Check if the input is already valid JSON
+    processed_string = repair_json(json_like_string)
+
+    # Try loading the processed string
     try:
-        return json.loads(json_like_string)
-    except json.JSONDecodeError:
-        pass  # If this fails, we attempt preprocessing
-    
-    # Replace single quotes with double quotes, but cautiously
-    processed_string = re.sub(
-        r"(?<![\\\"'])'(?![\\\"'])", '"',  # Replace single quotes not surrounded by valid JSON syntax
-        json_like_string
-    )
-    
-    try:
-        # Attempt to load the processed string
         return json.loads(processed_string)
     except json.JSONDecodeError as e:
         raise ValueError(f"Unable to parse JSON-like string: {e}")
@@ -250,26 +243,29 @@ Each dictionary in the `edits` list should contain:
             For "replace", this text replaces the line. If text is empty for "replace",
             it effectively deletes that line.
 
+DO NOT include backticks like ```, ```json, etc.
+
 Transcript:
 {transcript}
 
 List of edits of deletions and additions (no comments or preamble):
 """
 
-    # Create a PromptTemplate instance with the provided template
-    edit_prompt: PromptTemplate = PromptTemplate(
-        input_variables=["transcript"],
-        template=edit_prompt_template
-    )
-
-    # Combine the prompt template with the language model (llm)
-    edit_chain = edit_prompt | llm | StrOutputParser()
-
+    edit_prompt = edit_prompt_template.format(transcript=transcript_with_lines, instruction=instruction)
+    
     # Log the execution of the edit chain
     logger.debug("Executing edit chain")
 
-    # Invoke the language model with the transcript to get edits
-    edit_str: str = edit_chain.invoke({"transcript": transcript_with_lines, "instruction": instruction})
+    response = llm.invoke(edit_prompt)
+
+    edit_str = clean_text(response.content)
+    finish_reason = response.response_metadata.get("finish_reason", "STOP")
+
+    # Keep continuing if not finished
+    while finish_reason != "STOP":        
+        response = llm.invoke([("system", edit_prompt), ("assistant", edit_str), ('human', 'Continue from last character')])
+        edit_str += clean_text(response.content)
+        finish_reason = response.response_metadata.get("finish_reason", "STOP")
 
     # Convert the raw edit response into structured edit models
     edits: List[EditModel] = convert_edits_response_to_models_raw(edit_str)
