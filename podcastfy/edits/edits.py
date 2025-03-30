@@ -32,7 +32,7 @@ class EditModel(BaseModel):
     )
     text: str = Field(
         default="",
-        description="The text to use for addition or replacement. If empty on replace, it's effectively a deletion."
+        description="The text to use for addition or replacement. If empty on replace, it's effectively a deletion. The line number should not be included here."
     )
 
 class EditsResponse(BaseModel):
@@ -115,67 +115,42 @@ def convert_edits_response_to_models(response: EditsResponse) -> List[EditModel]
     return edit_models
 
 def apply_edits(lines: List[str], edits: List[EditModel]) -> List[str]:
-    # Represent final lines as a sorted list of (line_number, text).
-    # original lines start as (1, line1), (2, line2), ...
-    final_lines = [(i+1, l) for i, l in enumerate(lines)]
-
-    # Sort edits by line_number ascending
-    edits_sorted = sorted(edits, key=lambda e: e.line_number)
-
+    # Create a mutable copy of the lines
+    result = lines.copy()
+    
+    # Sort edits by line_number in descending order
+    edits_sorted = sorted(edits, key=lambda e: e.line_number, reverse=True)
+    
     for edit in edits_sorted:
         line_num = edit.line_number
         action = edit.action
         text = edit.text
-
-        # Find the position of line_num in final_lines
-        # We perform a binary-like search to find insertion/replacement point
-        idx = None
-        for i, (ln, _) in enumerate(final_lines):
-            if ln == line_num:
-                idx = i
-                break
-
+        
+        # Adjust line_num to 0-based indexing
+        idx = line_num - 1
+        
         if action == EditAction.ADDITION:
-            # Insert a new line at the position corresponding to line_num
-            if idx is not None:
-                # If that exact line_num exists, insert before it
-                final_lines.insert(idx, (line_num, text))
-            else:
-                # If not found, find where it would fit
-                insertion_point = None
-                for i, (ln, _) in enumerate(final_lines):
-                    if ln > line_num:
-                        insertion_point = i
-                        break
-                if insertion_point is None:
-                    # No larger line_num found, append at the end
-                    final_lines.append((line_num, text))
-                else:
-                    # Insert before the next larger line_num
-                    final_lines.insert(insertion_point, (line_num, text))
-
+            # For additions, insert at the specified position
+            if 0 <= idx <= len(result):
+                result.insert(idx, text)
+            elif idx > len(result):
+                # If line number is beyond the end, append at the end
+                result.append(text)
+        
         elif action == EditAction.REPLACE:
-            # Replace or delete
-            if text == "":
-                # Deletion
-                if idx is not None:
-                    del final_lines[idx]
-                # If line doesn't exist, it's a no-op
-            else:
-                # Replacement
-                if idx is None:
-                    # Line doesn't exist, cannot replace
-                    raise ValueError(f"Cannot replace line {line_num}: line does not exist.")
+            # For replacements, check if the line exists
+            if 0 <= idx < len(result):
+                if text == "":
+                    # If text is empty, delete the line
+                    result.pop(idx)
                 else:
-                    # Replace the text
-                    final_lines[idx] = (line_num, text)
-        else:
-            raise ValueError(f"Unknown action {action}")
-
-    # final_lines is always kept sorted, no additional sort needed
-    updated_texts = [t for (_, t) in final_lines]
-    return updated_texts
-
+                    # Otherwise replace it
+                    result[idx] = text
+            else:
+                # Line doesn't exist, raise error for replace action
+                raise ValueError(f"Cannot replace line {line_num}: line does not exist.")
+    
+    return result
 
 def load_json_agnostic_to_quotes(json_like_string):
     processed_string = repair_json(json_like_string)
